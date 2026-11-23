@@ -1,0 +1,79 @@
+{
+	"inputs": [
+	],
+	"servers": {
+		"context7": {
+			"type": "http",
+			"url": "https://mcp.context7.com/mcp"
+		},
+		"deepwiki": {
+			"type": "http",
+			"url": "https://mcp.deepwiki.com/mcp"
+		},
+		"windows-mcp": {
+			"type": "stdio",
+			"command": "uvx",
+			"args": [
+				"windows-mcp",
+				"serve",
+				"--transport",
+				"stdio"
+			]
+		},
+		"pyside6": {
+			"type": "stdio",
+			"command": "uvx",
+			"args": [
+				"--from",
+				"git+https://github.com/com55/pyside6-mcp",
+				"pyside6-mcp"
+			]
+		},
+		"markitdown": {
+			"type": "stdio",
+			"command": "uvx",
+			"args": [
+				"markitdown-mcp"
+			]
+		},
+		"ffmpeg-skill": {
+			"type": "stdio",
+			"command": "python",
+			"args": [
+				"${userHome}/.agents/skills/ffmpeg-skill/mcp/server.py"
+			],
+			"env": {
+				"FFMPEG_SKILL_MCP_FULL": "1"
+			}
+		},
+		"serena": {
+			"type": "stdio",
+			"command": "uvx",
+			"args": [
+				"--from",
+				"git+https://github.com/oraios/serena",
+				"serena",
+				"start-mcp-server",
+				"--context",
+				"ide"
+			]
+		},
+		"repomix": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"repomix",
+				"--mcp"
+			]
+		},
+		"basic-memory": {
+			"type": "stdio",
+			"command": "uvx",
+			"args": [
+				"basic-memory",
+				"mcp"
+			]
+		}
+	}
+}

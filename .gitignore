@@ -1,0 +1,50 @@
+# Secrets & local credentials (never commit)
+.env
+.env.*
+!.env.example
+.vscode/sftp.json
+*.key
+*.pem
+id_rsa*
+
+# Python bytecode, caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Local databases & dumps
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+!database/schema.sql
+
+# Logs, temporary & local runtime files
+*.log
+logs/
+tmp/
+temp/
+testdata/
+data/
+
+# Bundled CLI binaries & PyInstaller build outputs
+bin/
+build/
+dist/
+*.spec
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Uncomment if you put real credentials into project MCP configs:
+# .vscode/mcp.json
+# .agents/plugins/project-mcp/mcp_config.json

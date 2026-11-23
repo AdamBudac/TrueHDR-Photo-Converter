@@ -1,0 +1,68 @@
+{
+	"mcpServers": {
+		"context7": {
+			"url": "https://mcp.context7.com/mcp"
+		},
+		"deepwiki": {
+			"url": "https://mcp.deepwiki.com/mcp"
+		},
+		"windows-mcp": {
+			"command": "uvx",
+			"args": [
+				"windows-mcp",
+				"serve",
+				"--transport",
+				"stdio"
+			]
+		},
+		"pyside6": {
+			"command": "uvx",
+			"args": [
+				"--from",
+				"git+https://github.com/com55/pyside6-mcp",
+				"pyside6-mcp"
+			]
+		},
+		"markitdown": {
+			"command": "uvx",
+			"args": [
+				"markitdown-mcp"
+			]
+		},
+		"ffmpeg-skill": {
+			"command": "python",
+			"args": [
+				"<USER_HOME>/.agents/skills/ffmpeg-skill/mcp/server.py"
+			],
+			"env": {
+				"FFMPEG_SKILL_MCP_FULL": "1"
+			}
+		},
+		"serena": {
+			"command": "uvx",
+			"args": [
+				"--from",
+				"git+https://github.com/oraios/serena",
+				"serena",
+				"start-mcp-server",
+				"--context",
+				"ide"
+			]
+		},
+		"repomix": {
+			"command": "npx",
+			"args": [
+				"-y",
+				"repomix",
+				"--mcp"
+			]
+		},
+		"basic-memory": {
+			"command": "uvx",
+			"args": [
+				"basic-memory",
+				"mcp"
+			]
+		}
+	}
+}

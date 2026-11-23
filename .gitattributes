@@ -1,0 +1,31 @@
+# Auto-detect text files and normalize line endings to LF in the repository
+* text=auto eol=lf
+
+# Keep Python, Markdown, JSON, QSS, INI, and shell scripts LF
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.qss text eol=lf
+*.ini text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+
+# Keep Windows scripts CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Explicitly mark image, archive, and binary formats as binary (no diff/EOL mangling)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.jxl binary
+*.heic binary
+*.heif binary
+*.avif binary
+*.exr binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.zip binary

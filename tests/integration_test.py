@@ -1,0 +1,224 @@
+from pathlib import Path
+import logging
+from unittest.mock import patch
+
+from src.models import AppSettings
+from src.config import detect_tools
+from src.results import ImageConversionResult, OutputResult, OutputStatus
+from src.worker import ProcessingWorker
+
+
+def fake_convert_sdr(png_file: Path, settings: AppSettings, tool_map: dict, runner, logger: logging.Logger):
+    """Mock implementation that just creates dummy output files."""
+    result = ImageConversionResult(source_path=png_file)
+    stem = png_file.with_suffix("")
+    codecs = {"jpeg": ".jpg", "jpegxl": ".jxl", "heic": ".heic", "avif": ".avif"}
+    for codec, ext in codecs.items():
+        if settings.codec_enabled.get(codec):
+            output_path = stem.with_suffix(ext)
+            output_path.touch()
+            result.outputs.append(
+                OutputResult(
+                    codec=codec,
+                    status=OutputStatus.SUCCESS,
+                    output_path=output_path,
+                )
+            )
+    return result
+
+
+def fake_convert_hdr(png_file: Path, settings: AppSettings, tool_map: dict, runner, logger: logging.Logger, sdr_file=None):
+    """Mock implementation for HDR that creates dummy HDR-PQ / HDR-GM output files."""
+    from src.converter import hdr_output_stem
+    result = ImageConversionResult(source_path=png_file)
+    if settings.hdr_pq_enabled:
+        pq_stem = hdr_output_stem(png_file, "HDR-PQ")
+        for codec, ext in {"jpegxl": ".jxl", "heic": ".heic", "avif": ".avif"}.items():
+            if settings.codec_enabled.get(codec):
+                output_path = pq_stem.with_suffix(ext)
+                output_path.touch()
+                result.outputs.append(
+                    OutputResult(
+                        codec=codec,
+                        status=OutputStatus.SUCCESS,
+                        output_path=output_path,
+                    )
+                )
+    if settings.hdr_gm_enabled:
+        gm_stem = hdr_output_stem(png_file, "HDR-GM")
+        for codec, ext in {"jpeg": ".jpg", "avif": ".avif"}.items():
+            if settings.codec_enabled.get(codec):
+                output_path = gm_stem.with_suffix(ext)
+                output_path.touch()
+                result.outputs.append(
+                    OutputResult(
+                        codec=f"{codec}_gm",
+                        status=OutputStatus.SUCCESS,
+                        output_path=output_path,
+                    )
+                )
+    return result
+
+
+def test_full_pipeline_integration(tmp_path: Path):
+    """
+    End-to-end integration test of the ProcessingWorker pipeline.
+    It mocks the actual external encoder calls (cjpeg, cjxl, etc.) to test
+    the file discovery, renaming, sorting, and callback logic.
+    """
+    # 1. Prepare dummy input files
+    (tmp_path / "photo_a.png").write_bytes(b"dummy")
+    (tmp_path / "photo_b_HDR.png").write_bytes(b"dummy")
+    (tmp_path / "photo_b_HDR.exr").write_bytes(b"dummy")
+    (tmp_path / "photo_b_HDR.jpg").write_bytes(b"dummy")       # JPG HDR file
+    (tmp_path / "unrelated.jpg").write_bytes(b"notHDR")         # non-HDR JPEG – should be ignored
+    
+    # 2. Setup logger
+    logger = logging.getLogger("test-integration")
+    logger.addHandler(logging.NullHandler())
+
+    # 3. App Settings configured for renaming
+    settings = AppSettings()
+    settings.rename_enabled = True
+    settings.prefix = "TestImage_"
+    settings.start_counter = 1
+    settings.zero_fill_mode = "manual"
+    settings.zero_fill_digits = 3
+    # Enable a few codecs
+    settings.codec_enabled = {"jpeg": True, "jpegxl": True, "heic": False, "avif": False}
+
+    # We don't care about actual tools in this mock test, so pretend all are missing 
+    # except we bypass the check via our mock anyway.
+    tool_map = {}
+
+    # 4. Initialize worker
+    worker = ProcessingWorker(tmp_path, settings, tool_map, logger)
+
+    # 5. Patch the expensive / external operations
+    with patch("src.worker.convert_sdr", side_effect=fake_convert_sdr), \
+         patch("src.worker.convert_hdr", side_effect=fake_convert_hdr):
+        
+        # Run pipeline
+        worker.process()
+
+    # 6. Verify outputs
+    output_dir = tmp_path / "output"
+    assert output_dir.exists()
+
+    # We expect renamed files based on settings:
+    # photo_a.png -> TestImage_001.png -> TestImage_001.jpg, TestImage_001.jxl
+    # photo_b_HDR.png -> TestImage_002_HDR.png -> TestImage_002_HDR.jxl (no jpeg for HDR)
+    # photo_b_HDR.exr -> TestImage_002_HDR.exr
+    # photo_b_HDR.jpg -> TestImage_002_HDR.jpg  (renamed to match HDR PNG)
+
+    assert (output_dir / "TestImage_001.png").exists()
+    assert (output_dir / "TestImage_001.jpg").exists()
+    assert (output_dir / "TestImage_001.jxl").exists()
+
+    assert (output_dir / "TestImage_002_HDR.png").exists()
+    assert (output_dir / "TestImage_002_HDR-PQ.jxl").exists()
+    assert (output_dir / "TestImage_002_HDR-GM.jpg").exists()
+    
+    assert (output_dir / "TestImage_002_HDR.exr").exists()
+
+    # JPG HDR file should be renamed to match the HDR PNG counterpart
+    assert (output_dir / "TestImage_002_HDR.jpg").exists()
+
+    # Non-HDR JPEG should NOT be copied
+    assert not (output_dir / "unrelated.jpg").exists()
+
+    # Verify rename.log was generated
+    rename_log = output_dir / "rename.log"
+    assert rename_log.exists()
+    log_content = rename_log.read_text("utf-8")
+    assert "photo_a.png -> TestImage_001.png" in log_content
+    assert "photo_b_HDR.png -> TestImage_002_HDR.png" in log_content
+    assert "photo_b_HDR.exr -> TestImage_002_HDR.exr" in log_content
+    assert "photo_b_HDR.jpg -> TestImage_002_HDR.jpg" in log_content
+
+
+def test_companion_bw_color_not_swapped(tmp_path: Path):
+    """
+    Regression test: when a base has both Color and BW HDR companion files
+    (JPG/EXR), renaming must NOT swap them.  Previously, alphabetical sort
+    put _BW_HDR before _HDR, while the rename-plan stems were Color-first,
+    causing a BW ↔ Color mismatch.
+    """
+    # Mimic the user's real file set (one base, all variants)
+    (tmp_path / "photo_HDR.png").write_bytes(b"dummy")
+    (tmp_path / "photo_BW_HDR.png").write_bytes(b"dummy")
+    (tmp_path / "photo.png").write_bytes(b"dummy")
+    (tmp_path / "photo_BW.png").write_bytes(b"dummy")
+    # Companion JPG HDR files (Color + BW)
+    (tmp_path / "photo_HDR.jpg").write_bytes(b"dummy")
+    (tmp_path / "photo_BW_HDR.jpg").write_bytes(b"dummy")
+    # Companion EXR files (Color + BW)
+    (tmp_path / "photo_HDR.exr").write_bytes(b"dummy")
+    (tmp_path / "photo_BW_HDR.exr").write_bytes(b"dummy")
+
+    logger = logging.getLogger("test-bw-swap")
+    logger.addHandler(logging.NullHandler())
+
+    settings = AppSettings()
+    settings.rename_enabled = True
+    settings.prefix = "Img_"
+    settings.start_counter = 1
+    settings.zero_fill_mode = "auto"
+    settings.codec_enabled = {"jpeg": True, "jpegxl": False, "heic": False, "avif": False}
+
+    worker = ProcessingWorker(tmp_path, settings, {}, logger)
+
+    with patch("src.worker.convert_sdr", side_effect=fake_convert_sdr), \
+         patch("src.worker.convert_hdr", side_effect=fake_convert_hdr):
+        worker.process()
+
+    out = tmp_path / "output"
+
+    # --- HDR Color companion files must get the _HDR stem (NOT _BW_HDR) ---
+    assert (out / "Img_1_HDR.jpg").exists(), "Color JPG HDR should be Img_1_HDR.jpg"
+    assert (out / "Img_1_HDR.exr").exists(), "Color EXR should be Img_1_HDR.exr"
+
+    # --- HDR BW companion files must get the _BW_HDR stem (NOT _HDR) ---
+    assert (out / "Img_1_BW_HDR.jpg").exists(), "BW JPG HDR should be Img_1_BW_HDR.jpg"
+    assert (out / "Img_1_BW_HDR.exr").exists(), "BW EXR should be Img_1_BW_HDR.exr"
+
+    # Verify via rename.log
+    log_content = (out / "rename.log").read_text("utf-8")
+    assert "photo_HDR.jpg -> Img_1_HDR.jpg" in log_content
+    assert "photo_BW_HDR.jpg -> Img_1_BW_HDR.jpg" in log_content
+    assert "photo_HDR.exr -> Img_1_HDR.exr" in log_content
+    assert "photo_BW_HDR.exr -> Img_1_BW_HDR.exr" in log_content
+
+
+def test_worker_runs_hdr_exr_independently_of_hdr_checkboxes(tmp_path: Path):
+    """EXR (HDR only) must run on HDR PNGs even when both HDR/PQ and HDR/GM are off."""
+    (tmp_path / "shot_HDR.png").write_bytes(b"dummy")
+    logger = logging.getLogger("test-exr-indep")
+    logger.addHandler(logging.NullHandler())
+
+    settings = AppSettings(
+        rename_enabled=False,
+        sdr_enabled=False,
+        hdr_pq_enabled=False,
+        hdr_gm_enabled=False,
+        codec_enabled={"jpeg": False, "jpegxl": False, "heic": False, "avif": False, "exr": True},
+    )
+    called_hdr = []
+
+    def _fake_hdr_exr(png_file, settings, tool_map, runner, logger, sdr_file=None):
+        called_hdr.append(png_file.name)
+        exr_out = png_file.with_suffix(".exr")
+        exr_out.touch()
+        return ImageConversionResult(
+            source_path=png_file,
+            outputs=[OutputResult(codec="exr", status=OutputStatus.SUCCESS, output_path=exr_out)],
+        )
+
+    worker = ProcessingWorker(tmp_path, settings, {}, logger)
+    with patch("src.worker.convert_hdr", side_effect=_fake_hdr_exr):
+        summary = worker.process()
+
+    assert called_hdr == ["shot_HDR.png"]
+    assert summary.successful_images == 1
+    assert summary.skipped_images == 0
+    assert (tmp_path / "output" / "shot_HDR.exr").exists()

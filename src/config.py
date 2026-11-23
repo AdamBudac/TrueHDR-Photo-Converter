@@ -1,0 +1,294 @@
+"""Configuration management – paths, load/save settings, tool detection, logging setup."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from src.models import (
+    ALL_CODECS,
+    ALL_EXTERNAL_TOOLS,
+    AppSettings,
+    CODECS_WITH_QUALITY,
+    DEFAULT_SETTINGS,
+    EXR_COMPRESSIONS,
+    TOOLS_FOR_CODECS,
+    clamp_int,
+)
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def is_frozen() -> bool:
+    """Return ``True`` when running inside a PyInstaller bundle."""
+    return getattr(sys, "frozen", False)
+
+
+def config_root() -> Path:
+    """Return the platform-specific directory for application config files."""
+    if sys.platform.startswith("win"):
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "TrueHDRPhotoConverter"
+
+
+def _is_portable_frozen() -> bool:
+    """Return ``True`` when running as a portable frozen build (``--onedir`` or local ``data/``)."""
+    if not is_frozen():
+        return False
+    exe_dir = Path(sys.executable).parent
+    return (exe_dir / "_internal").is_dir() or (exe_dir / "data").is_dir()
+
+
+def config_file() -> Path:
+    """Return the path to the default settings JSON file.
+
+    Prioritises portable ``data/settings.json`` next to the executable in
+    ``--onedir`` portable builds (or whenever ``data/settings.json`` exists in
+    CWD / next to the EXE), otherwise falls back to ``%APPDATA%/TrueHDRPhotoConverter/``.
+    """
+    if _is_portable_frozen():
+        return Path(sys.executable).parent / "data" / "settings.json"
+
+    portable_cwd = Path.cwd() / "data" / "settings.json"
+    if portable_cwd.exists():
+        return portable_cwd
+
+    if is_frozen():
+        portable_exe = Path(sys.executable).parent / "data" / "settings.json"
+        if portable_exe.exists():
+            return portable_exe
+
+    return config_root() / "settings.json"
+
+
+def ensure_config_dir(path: Path) -> None:
+    """Create the parent directory for the given config path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def logs_dir() -> Path:
+    """Return the platform-appropriate directory for application logs.
+
+    Development mode (script): repository root ``logs/``
+    Frozen portable mode (``--onedir`` or ``data/`` next to EXE): ``<exe_dir>/data/logs/``
+    Frozen standard mode (``--onefile`` EXE): ``<config_root>/logs/``
+    """
+    if _is_portable_frozen():
+        base = Path(sys.executable).parent / "data" / "logs"
+    elif is_frozen():
+        base = config_root() / "logs"
+    else:
+        base = Path(__file__).resolve().parents[1] / "logs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Settings serialisation
+# ---------------------------------------------------------------------------
+
+def settings_from_dict(data: Dict, logger: Optional[logging.Logger]) -> AppSettings:
+    """Parse a raw ``dict`` (e.g. from JSON) into a validated :class:`AppSettings`."""
+    settings = AppSettings()
+    settings.rename_enabled = bool(data.get("rename_enabled", settings.rename_enabled))
+    settings.prefix = str(data.get("prefix", settings.prefix)) or settings.prefix
+    settings.space_after_prefix = bool(
+        data.get("space_after_prefix", settings.space_after_prefix)
+    )
+    settings.counter_enabled = bool(data.get("counter_enabled", settings.counter_enabled))
+    settings.start_counter = clamp_int(
+        data.get("start_counter", settings.start_counter),
+        settings.start_counter, 0, 999999, "start_counter", logger,
+    )
+    settings.zero_fill_enabled = bool(data.get("zero_fill_enabled", settings.zero_fill_enabled))
+    settings.zero_fill_mode = (
+        "manual"
+        if str(data.get("zero_fill_mode", settings.zero_fill_mode)).lower() == "manual"
+        else "auto"
+    )
+    settings.zero_fill_digits = clamp_int(
+        data.get("zero_fill_digits", settings.zero_fill_digits),
+        settings.zero_fill_digits, 1, 99, "zero_fill_digits", logger,
+    )
+    settings.sdr_enabled = bool(data.get("sdr_enabled", settings.sdr_enabled))
+    legacy_hdr = data.get("hdr_enabled")
+    if "hdr_pq_enabled" in data:
+        settings.hdr_pq_enabled = bool(data["hdr_pq_enabled"])
+    elif legacy_hdr is not None:
+        settings.hdr_pq_enabled = bool(legacy_hdr)
+    if "hdr_gm_enabled" in data:
+        settings.hdr_gm_enabled = bool(data["hdr_gm_enabled"])
+    elif legacy_hdr is not None:
+        settings.hdr_gm_enabled = bool(legacy_hdr)
+    settings.last_input_dir = data.get("last_input_dir", settings.last_input_dir)
+
+    # Codec flags
+    codec_enabled = data.get("codec_enabled", settings.codec_enabled)
+    settings.codec_enabled = {
+        c: bool(codec_enabled.get(c, settings.codec_enabled[c])) for c in ALL_CODECS
+    }
+
+    # Codec quality (only codecs that expose a 0-100 lossy quality parameter)
+    codec_quality = data.get("codec_quality", settings.codec_quality)
+    settings.codec_quality = {
+        c: clamp_int(
+            codec_quality.get(c, settings.codec_quality[c]),
+            settings.codec_quality[c], 0, 100, f"{c}_quality", logger,
+        )
+        for c in CODECS_WITH_QUALITY
+    }
+
+    # EXR compression method
+    raw_exr_comp = str(data.get("exr_compression", settings.exr_compression)).strip().lower()
+    if raw_exr_comp in EXR_COMPRESSIONS:
+        settings.exr_compression = raw_exr_comp
+    elif logger:
+        logger.warning(
+            "exr_compression '%s' invalid; using default '%s'",
+            raw_exr_comp,
+            settings.exr_compression,
+        )
+    return settings
+
+
+def load_settings_from_file(
+    path: Path, logger: Optional[logging.Logger]
+) -> AppSettings:
+    """Read *path* as JSON and return a validated :class:`AppSettings`."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return settings_from_dict(data, logger)
+    except Exception as exc:
+        if logger:
+            logger.warning("Failed to load settings from %s: %s", path, exc)
+        return DEFAULT_SETTINGS
+
+
+def save_settings_to_file(settings: AppSettings, path: Path) -> None:
+    """Write *settings* to *path* as pretty-printed JSON."""
+    ensure_config_dir(path)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(settings.to_dict(), f, indent=4)
+
+
+# ---------------------------------------------------------------------------
+# External tool detection
+# ---------------------------------------------------------------------------
+
+def detect_tools() -> Dict[str, bool]:
+    """Check which Python encoders and bundled/external CLI tools are available."""
+    bundled_dirs: List[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundled_dirs.append(Path(meipass) / "bin")
+    if is_frozen():
+        bundled_dirs.append(Path(sys.executable).parent / "bin")
+    else:
+        bundled_dirs.append(Path(__file__).resolve().parents[1] / "bin")
+
+    fallback_dirs = [
+        Path(r"C:\Program Files\AVIF"),
+        Path(r"C:\Program Files\libavif"),
+        Path(r"C:\Program Files\JPEG XL\bin"),
+        Path(r"C:\Program Files\JPEG XL"),
+    ]
+
+    # Prepend bundled bin/ so shipped binaries take priority over system PATH,
+    # and append standard fallback install directories.
+    current_path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    prepend_parts = [
+        str(p) for p in bundled_dirs if p.exists() and str(p) not in current_path_parts
+    ]
+    append_parts = [
+        str(p)
+        for p in fallback_dirs
+        if p.exists() and str(p) not in current_path_parts and str(p) not in prepend_parts
+    ]
+    if prepend_parts or append_parts:
+        os.environ["PATH"] = os.pathsep.join(
+            prepend_parts + current_path_parts + append_parts
+        )
+
+    from src.exr_encoder import is_openexr_available
+    from src.python_encoders import is_imagecodecs_available, is_pillow_heif_available
+
+    python_checks = {
+        "openexr_python": is_openexr_available,
+        "imagecodecs_python": is_imagecodecs_available,
+        "pillow_heif_python": is_pillow_heif_available,
+    }
+
+    availability: Dict[str, bool] = {}
+    for tool in ALL_EXTERNAL_TOOLS:
+        if tool in python_checks:
+            availability[tool] = python_checks[tool]()
+        else:
+            availability[tool] = shutil.which(tool) is not None
+    return availability
+
+
+def required_tools_missing_for_codec(
+    codec: str, tool_map: Dict[str, bool]
+) -> List[str]:
+    """Return the list of tools required by *codec* that are **not** available."""
+    required = TOOLS_FOR_CODECS.get(codec, [])
+    return [tool for tool in required if not tool_map.get(tool, False)]
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+class _ErrorLogFilter(logging.Filter):
+    """Allow only records explicitly marked for the dedicated error log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return bool(getattr(record, "error_log", False))
+
+
+def close_file_loggers(logger: logging.Logger) -> None:
+    """Detach and close every file handler owned by *logger*."""
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def attach_file_logger(
+    logger: logging.Logger,
+    log_path: Path,
+    errors_log_path: Optional[Path] = None,
+) -> None:
+    """Replace file handlers with fresh main and optional error log handlers.
+
+    Records sent with ``extra={"error_log": True}`` are written to both the
+    main log and the dedicated error log.  All other records are written only
+    to the main log.
+    """
+    close_file_loggers(logger)
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    if errors_log_path is not None:
+        errors_handler = logging.FileHandler(
+            errors_log_path, mode="w", encoding="utf-8"
+        )
+        errors_handler.setFormatter(formatter)
+        errors_handler.addFilter(_ErrorLogFilter())
+        logger.addHandler(errors_handler)
